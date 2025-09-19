@@ -99,7 +99,7 @@ class Target:
 @dataclass
 class Row:
     target: Target
-    totals: Dict[int, Tuple[int, int, Optional[float]]]  # window_secs -> (total, fails, loss_pct)
+    totals: Dict[int, Tuple[int, int, Optional[float], Optional[float]]]  # window_secs -> (total, fails, loss_pct, avg_rtt)
 
 
 # --------------------
@@ -111,24 +111,25 @@ def load_targets(conn: sqlite3.Connection) -> List[Target]:
     return [Target(id=r[0], name=r[1]) for r in rows]
 
 
-def load_loss_for_window(conn: sqlite3.Connection, window_secs: int) -> Dict[str, Tuple[int, int, Optional[float]]]:
+def load_loss_for_window(conn: sqlite3.Connection, window_secs: int) -> Dict[str, Tuple[int, int, Optional[float], Optional[float]]]:
     cutoff = int(time.time()) - window_secs
     rows = query_with_retry(
         conn,
         """
         SELECT target_id,
                COUNT(*) as total,
-               SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) as fails
+               SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) as fails,
+               AVG(CASE WHEN ok=1 AND rtt_ms IS NOT NULL THEN rtt_ms ELSE NULL END) as avg_rtt
           FROM ping_samples
          WHERE ts >= ?
          GROUP BY target_id
         """,
         (cutoff,),
     )
-    out: Dict[str, Tuple[int, int, Optional[float]]] = {}
-    for tid, total, fails in rows:
+    out: Dict[str, Tuple[int, int, Optional[float], Optional[float]]] = {}
+    for tid, total, fails, avg_rtt in rows:
         loss = (100.0 * fails / total) if total else None
-        out[tid] = (total, fails, loss)
+        out[tid] = (total, fails, loss, avg_rtt)
     return out
 
 
@@ -146,6 +147,51 @@ def fmt_loss(loss: Optional[float], total: int) -> Text:
         style = "red"
     else:
         style = "bold red"
+    return Text(s, style=style)
+
+
+def calculate_rtt_thresholds(window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]]) -> Tuple[float, float]:
+    # Collect all valid RTT values from all windows
+    all_rtts = []
+    for window_data in window_maps.values():
+        for target_id, (total, fails, loss, avg_rtt) in window_data.items():
+            if avg_rtt is not None and total > 0:
+                all_rtts.append(avg_rtt)
+
+    if len(all_rtts) < 3:
+        # Fallback to reasonable defaults if not enough data
+        return 50.0, 100.0
+
+    # Sort and calculate median-based thresholds
+    all_rtts.sort()
+    n = len(all_rtts)
+
+    # Use 33rd and 67th percentiles as thresholds
+    thresh_low = all_rtts[n // 3]
+    thresh_high = all_rtts[(2 * n) // 3]
+
+    return thresh_low, thresh_high
+
+
+def fmt_avg_rtt(avg_rtt: Optional[float], total: int, thresh_low: float, thresh_high: float) -> Text:
+    if total < 1 or avg_rtt is None:
+        return Text("--", style="dim")
+    val = avg_rtt
+
+    # Format precision based on value
+    if val < 10.0:
+        s = f"{val:.1f}ms"
+    else:
+        s = f"{val:.0f}ms"
+
+    # Dynamic color thresholds
+    if val <= thresh_low:
+        style = "bold green"
+    elif val <= thresh_high:
+        style = "yellow"
+    else:
+        style = "bold red"
+
     return Text(s, style=style)
 
 
@@ -218,28 +264,34 @@ def cluster_routes(routes: Dict[str, List[str]], threshold: float = SIM_THRESHOL
 # Rendering
 # --------------------
 
-def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float]]]]) -> Table:
+def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]]) -> Table:
     tbl = Table(box=box.SIMPLE_HEAVY)
     tbl.add_column("Location", width=30)
     for _w, label in WINDOWS:
         tbl.add_column(label, justify="right")
 
-    # Build rows with sorting
-    def get_loss(tid: str, w: int) -> Tuple[int, Optional[float]]:
-        rec = window_maps[w].get(tid)
-        if rec is None:
-            return 0, None
-        total, _fails, loss = rec
-        return total, loss
+    # Calculate dynamic RTT thresholds
+    thresh_low, thresh_high = calculate_rtt_thresholds(window_maps)
 
-    sorted_targets = sorted(
-        targets,
-        key=lambda t: (
-            -(get_loss(t.id, 300)[1] if get_loss(t.id, 300)[1] is not None else -1.0),
-            -(get_loss(t.id, 3600)[1] if get_loss(t.id, 3600)[1] is not None else -1.0),
-            t.name.lower(),
-        ),
-    )
+    # Build rows with sorting
+    def get_sort_key(target: Target) -> Tuple[float, float, float, str]:
+        # Get 5m stats
+        rec_5m = window_maps[300].get(target.id)
+        loss_5m = rec_5m[2] if rec_5m and rec_5m[2] is not None else -1.0
+        rtt_5m = rec_5m[3] if rec_5m and rec_5m[3] is not None else float('inf')
+
+        # Get 1h stats
+        rec_1h = window_maps[3600].get(target.id)
+        loss_1h = rec_1h[2] if rec_1h and rec_1h[2] is not None else -1.0
+
+        return (
+            -loss_5m,      # 5m loss descending (higher loss first)
+            rtt_5m,        # 5m ping ascending (lower ping first)
+            -loss_1h,      # 1h loss descending (tie breaker)
+            target.name.lower()  # name ascending
+        )
+
+    sorted_targets = sorted(targets, key=get_sort_key)
 
     for t in sorted_targets:
         row = [Text(f"{t.name} [{t.id}]", style="bold")]
@@ -248,8 +300,14 @@ def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[in
             if rec is None:
                 row.append(Text("--", style="dim"))
             else:
-                total, _fails, loss = rec
-                row.append(fmt_loss(loss, total))
+                total, _fails, loss, avg_rtt = rec
+                loss_text = fmt_loss(loss, total)
+                rtt_text = fmt_avg_rtt(avg_rtt, total, thresh_low, thresh_high)
+                combined = Text()
+                combined.append_text(loss_text)
+                combined.append(" / ")
+                combined.append_text(rtt_text)
+                row.append(combined)
         tbl.add_row(*row)
     return tbl
 
@@ -293,7 +351,7 @@ def build_routes_panel(targets_by_id: Dict[str, Target], routes: Dict[str, List[
 def layout_render(conn: sqlite3.Connection) -> Panel:
     # fetch data
     targets = load_targets(conn)
-    window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float]]]] = {}
+    window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]] = {}
     for w, _label in WINDOWS:
         window_maps[w] = load_loss_for_window(conn, w)
 
@@ -301,7 +359,7 @@ def layout_render(conn: sqlite3.Connection) -> Panel:
 
     # compose
     table = build_table(targets, window_maps)
-    top = Panel(table, title="Netwatch — Loss by Window (sorted by 5m)")
+    top = Panel(table, title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
 
     targets_by_id = {t.id: t for t in targets}
     routes_panel = build_routes_panel(targets_by_id, routes)

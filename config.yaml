@@ -8,10 +8,6 @@ concurrency:
   ping: 30
   traceroute: 3
 targets:
-  - id: eu-fra-1
-    name: Frankfurt
-    host: rs1.fra.de-cix.net
-    family: auto
   - id: eu-fra-2
     name: Frankfurt
     host: ec2.eu-central-1.amazonaws.com
@@ -28,14 +24,6 @@ targets:
     name: Paris
     host: par-fr-ping.vultr.com
     family: v4
-  - id: eu-ams-1
-    name: Amsterdam
-    host: rs1.ams-ix.net
-    family: auto
-  - id: eu-mad-1
-    name: Madrid
-    host: rs1.mad.de-cix.net
-    family: auto
   - id: eu-mil-1
     name: Milan
     host: ec2.eu-south-1.amazonaws.com
@@ -56,14 +44,6 @@ targets:
     name: Prague
     host: cz-prg-as6881.anchors.atlas.ripe.net
     family: auto
-  - id: na-nyc-1
-    name: New York City
-    host: rs1.nyc.de-cix.net
-    family: auto
-  - id: na-nyc-2
-    name: New York City
-    host: speedtest-nyc3.digitalocean.com
-    family: v4
   - id: na-iad-1
     name: Ashburn
     host: ec2.us-east-1.amazonaws.com
@@ -76,10 +56,6 @@ targets:
     name: Chicago
     host: il-us-ping.vultr.com
     family: v4
-  - id: na-dal-1
-    name: Dallas
-    host: rs1.dfw.de-cix.net
-    family: auto
   - id: na-dal-2
     name: Dallas
     host: tx-us-ping.vultr.com
@@ -95,10 +71,6 @@ targets:
   - id: na-sea-2
     name: Seattle
     host: ec2.us-west-2.amazonaws.com
-    family: v4
-  - id: na-tor-1
-    name: Toronto
-    host: speedtest-tor1.digitalocean.com
     family: v4
   - id: na-tor-2
     name: Toronto

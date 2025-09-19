@@ -5,3 +5,5 @@ netwatch.db-wal
 
 # Virtual environment
 venv/
+
+__pycache__
