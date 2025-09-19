@@ -1,0 +1,7 @@
+# Database files
+netwatch.db
+netwatch.db-shm
+netwatch.db-wal
+
+# Virtual environment
+venv/

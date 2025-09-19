@@ -1,0 +1,166 @@
+probe_interval_secs: 60
+trace_interval_secs: 600
+ping_timeout_secs: 2
+traceroute_timeout_secs: 15
+traceroute_per_hop_timeout: 1
+traceroute_max_hops: 30
+concurrency:
+  ping: 30
+  traceroute: 3
+targets:
+  - id: eu-fra-1
+    name: Frankfurt
+    host: rs1.fra.de-cix.net
+    family: auto
+  - id: eu-fra-2
+    name: Frankfurt
+    host: ec2.eu-central-1.amazonaws.com
+    family: v4
+  - id: eu-lon-1
+    name: London
+    host: uk-lon-as201126.anchors.atlas.ripe.net
+    family: v4
+  - id: eu-lon-2
+    name: London
+    host: ec2.eu-west-2.amazonaws.com
+    family: v4
+  - id: eu-par-1
+    name: Paris
+    host: par-fr-ping.vultr.com
+    family: v4
+  - id: eu-ams-1
+    name: Amsterdam
+    host: rs1.ams-ix.net
+    family: auto
+  - id: eu-mad-1
+    name: Madrid
+    host: rs1.mad.de-cix.net
+    family: auto
+  - id: eu-mil-1
+    name: Milan
+    host: ec2.eu-south-1.amazonaws.com
+    family: v4
+  - id: eu-sto-1
+    name: Stockholm
+    host: sto-se-ping.vultr.com
+    family: v4
+  - id: eu-waw-1
+    name: Warsaw
+    host: waw-pl-ping.vultr.com
+    family: v4
+  - id: eu-zrh-1
+    name: Zurich
+    host: ec2.eu-central-2.amazonaws.com
+    family: v4
+  - id: eu-prg-1
+    name: Prague
+    host: cz-prg-as6881.anchors.atlas.ripe.net
+    family: auto
+  - id: na-nyc-1
+    name: New York City
+    host: rs1.nyc.de-cix.net
+    family: auto
+  - id: na-nyc-2
+    name: New York City
+    host: speedtest-nyc3.digitalocean.com
+    family: v4
+  - id: na-iad-1
+    name: Ashburn
+    host: ec2.us-east-1.amazonaws.com
+    family: v4
+  - id: na-iad-2
+    name: Ashburn
+    host: us-qas-as49544.anchors.atlas.ripe.net
+    family: auto
+  - id: na-chi-1
+    name: Chicago
+    host: il-us-ping.vultr.com
+    family: v4
+  - id: na-dal-1
+    name: Dallas
+    host: rs1.dfw.de-cix.net
+    family: auto
+  - id: na-dal-2
+    name: Dallas
+    host: tx-us-ping.vultr.com
+    family: v4
+  - id: na-lax-1
+    name: Los Angeles
+    host: lax-ca-us-ping.vultr.com
+    family: v4
+  - id: na-sea-1
+    name: Seattle
+    host: wa-us-ping.vultr.com
+    family: v4
+  - id: na-sea-2
+    name: Seattle
+    host: ec2.us-west-2.amazonaws.com
+    family: v4
+  - id: na-tor-1
+    name: Toronto
+    host: speedtest-tor1.digitalocean.com
+    family: v4
+  - id: na-tor-2
+    name: Toronto
+    host: tor-ca-ping.vultr.com
+    family: v4
+  - id: na-atl-1
+    name: Atlanta
+    host: ga-us-ping.vultr.com
+    family: v4
+  - id: na-mia-1
+    name: Miami
+    host: fl-us-ping.vultr.com
+    family: v4
+  - id: na-mex-1
+    name: Mexico City
+    host: mex-mx-ping.vultr.com
+    family: v4
+  - id: sa-sao-1
+    name: São Paulo
+    host: ec2.sa-east-1.amazonaws.com
+    family: v4
+  - id: sa-sao-2
+    name: São Paulo
+    host: sao-br-ping.vultr.com
+    family: v4
+  - id: sa-scl-1
+    name: Santiago
+    host: cl-scl-as27678.anchors.atlas.ripe.net
+    family: auto
+  - id: sa-bue-1
+    name: Buenos Aires
+    host: ar-bue-as4270.anchors.atlas.ripe.net
+    family: auto
+  - id: af-jnb-1
+    name: Johannesburg
+    host: za-jnb-as328964.anchors.atlas.ripe.net
+    family: auto
+  - id: af-jnb-2
+    name: Johannesburg
+    host: obs.af-south-1.myhuaweicloud.com
+    family: auto
+  - id: af-nbo-1
+    name: Nairobi
+    host: ke-nbo-as328977.anchors.atlas.ripe.net
+    family: auto
+  - id: me-dxb-1
+    name: Dubai
+    host: ae-dxb-as15802.anchors.atlas.ripe.net
+    family: auto
+  - id: me-dxb-2
+    name: Dubai
+    host: ec2.me-central-1.amazonaws.com
+    family: v4
+  - id: me-bom-1
+    name: Mumbai
+    host: ec2.ap-south-1.amazonaws.com
+    family: v4
+  - id: me-bom-2
+    name: Mumbai
+    host: speedtest.mumbai1.linode.com
+    family: auto
+  - id: me-ist-1
+    name: Istanbul
+    host: tr-ist-as205961.anchors.atlas.ripe.net
+    family: auto
