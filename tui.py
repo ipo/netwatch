@@ -261,6 +261,39 @@ def cluster_routes(routes: Dict[str, List[str]], threshold: float = SIM_THRESHOL
 
 
 # --------------------
+# Offline detection
+# --------------------
+
+def check_offline_status(conn: sqlite3.Connection, offline_threshold: int) -> Optional[float]:
+    # Get the most recent pings across all targets
+    rows = query_with_retry(
+        conn,
+        """
+        SELECT ts, ok
+          FROM ping_samples
+      ORDER BY ts DESC
+         LIMIT ?
+        """,
+        (offline_threshold,),
+    )
+
+    if len(rows) < offline_threshold:
+        return None
+
+    # Check if all recent pings failed
+    all_failed = all(row[1] == 0 for row in rows)
+    if not all_failed:
+        return None
+
+    # Calculate offline duration from the oldest failed ping
+    oldest_failed_ts = rows[-1][0]
+    current_time = time.time()
+    offline_minutes = (current_time - oldest_failed_ts) / 60.0
+
+    return offline_minutes
+
+
+# --------------------
 # Rendering
 # --------------------
 
@@ -318,6 +351,11 @@ def format_route_line(hops: List[str], max_hops: int = 30) -> Text:
     return Text(" \u2192 ".join(hops))
 
 
+def build_offline_banner(offline_minutes: float) -> Text:
+    message = f" === OFFLINE FOR {offline_minutes:.1f} MINUTES ==="
+    return Text(message, style="bold white on red")
+
+
 def build_routes_panel(targets_by_id: Dict[str, Target], routes: Dict[str, List[str]]) -> Panel:
     if not routes:
         return Panel(Text("No recent traceroutes (last 2h)."), title="Approximate Routes (2h)")
@@ -348,8 +386,8 @@ def build_routes_panel(targets_by_id: Dict[str, Target], routes: Dict[str, List[
     return Panel(body, title="Approximate Routes (2h)")
 
 
-def layout_render(conn: sqlite3.Connection) -> Panel:
-    # fetch data
+def layout_render(conn: sqlite3.Connection, offline_threshold: int) -> Panel:
+    # fetch data for normal display
     targets = load_targets(conn)
     window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]] = {}
     for w, _label in WINDOWS:
@@ -357,14 +395,26 @@ def layout_render(conn: sqlite3.Connection) -> Panel:
 
     routes = load_latest_routes(conn)
 
-    # compose
+    # check offline status
+    offline_minutes = check_offline_status(conn, offline_threshold)
+
+    # compose layout elements
     table = build_table(targets, window_maps)
-    top = Panel(table, title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
+
+    # if offline, show banner instead of normal title
+    if offline_minutes is not None:
+        offline_banner = build_offline_banner(offline_minutes)
+        top = Panel(table, title="")
+        banner_panel = Panel(Align.center(offline_banner), style="bold red", box=box.HEAVY)
+        content = Group(banner_panel, top)
+    else:
+        top = Panel(table, title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
+        content = Group(top)
 
     targets_by_id = {t.id: t for t in targets}
     routes_panel = build_routes_panel(targets_by_id, routes)
 
-    return Panel(Group(top, routes_panel), box=box.SQUARE)
+    return Panel(Group(content, routes_panel), box=box.SQUARE)
 
 
 # --------------------
@@ -384,7 +434,8 @@ def read_stdin_nonblocking() -> Optional[str]:
 
 @app.command()
 def tui(db: str = typer.Option(..., help="Path to SQLite database"),
-        refresh: float = typer.Option(1.0, help="Refresh interval seconds")):
+        refresh: float = typer.Option(1.0, help="Refresh interval seconds"),
+        offline_threshold: int = typer.Option(3, help="Number of consecutive failed pings to trigger offline mode")):
     conn = db_connect_ro(db)
 
     stop = False
@@ -397,10 +448,10 @@ def tui(db: str = typer.Option(..., help="Path to SQLite database"),
     except Exception:
         pass
 
-    with Live(Align.left(layout_render(conn)), console=console, refresh_per_second=(1.0 / refresh if refresh > 0 else 4.0), screen=True) as live:
+    with Live(Align.left(layout_render(conn, offline_threshold)), console=console, refresh_per_second=(1.0 / refresh if refresh > 0 else 4.0), screen=True) as live:
         while not stop:
             try:
-                view = Align.left(layout_render(conn))
+                view = Align.left(layout_render(conn, offline_threshold))
             except Exception as e:
                 view = Panel(Text(f"Error: {e}", style="red"), title="Netwatch")
             live.update(view, refresh=True)  # in-place screen update
