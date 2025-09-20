@@ -17,9 +17,11 @@ Features (MVP):
 Requirements:
   rich
   typer
+  PyYAML (via probe.py import)
 
 Usage:
   python netwatch_tui.py --db ./netwatch.db --refresh 1.0
+  python netwatch_tui.py --db ./netwatch.db --config ./config.yaml --refresh 1.0
 """
 from __future__ import annotations
 
@@ -103,11 +105,43 @@ class Row:
 
 
 # --------------------
+# Config loading
+# --------------------
+
+def load_config_targets(config_path: Optional[str]) -> List[str]:
+    """Load target IDs from config file using probe.py's config loader."""
+    if not config_path:
+        return []
+
+    try:
+        # Import probe.py's config loader to avoid duplication
+        from probe import load_config
+        cfg = load_config(config_path)
+        return [t.id for t in cfg.targets]
+    except (FileNotFoundError, ImportError, ValueError, Exception):
+        return []
+
+
+# --------------------
 # Data access
 # --------------------
 
-def load_targets(conn: sqlite3.Connection) -> List[Target]:
-    rows = query_with_retry(conn, "SELECT id,name FROM targets ORDER BY name")
+def load_targets(conn: sqlite3.Connection, config_targets: List[str] = None) -> List[Target]:
+    if config_targets is None:
+        # If no config targets provided, return all targets (backward compatibility)
+        rows = query_with_retry(conn, "SELECT id,name FROM targets ORDER BY name")
+        return [Target(id=r[0], name=r[1]) for r in rows]
+
+    # Filter to only include targets that are in the config
+    if not config_targets:
+        return []
+
+    placeholders = ','.join('?' * len(config_targets))
+    rows = query_with_retry(
+        conn,
+        f"SELECT id,name FROM targets WHERE id IN ({placeholders}) ORDER BY name",
+        tuple(config_targets)
+    )
     return [Target(id=r[0], name=r[1]) for r in rows]
 
 
@@ -518,9 +552,9 @@ def build_routes_panel(targets_by_id: Dict[str, Target], routes: Dict[str, List[
     return Panel(body, title="Approximate Routes (2h)")
 
 
-def layout_render(conn: sqlite3.Connection, offline_threshold: int) -> Panel:
+def layout_render(conn: sqlite3.Connection, offline_threshold: int, config_targets: List[str] = None) -> Panel:
     # fetch data for normal display
-    targets = load_targets(conn)
+    targets = load_targets(conn, config_targets)
     window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]] = {}
     for w, _label in WINDOWS:
         window_maps[w] = load_loss_for_window(conn, w)
@@ -578,8 +612,10 @@ def read_stdin_nonblocking() -> Optional[str]:
 @app.command()
 def tui(db: str = typer.Option(..., help="Path to SQLite database"),
         refresh: float = typer.Option(1.0, help="Refresh interval seconds"),
-        offline_threshold: int = typer.Option(3, help="Number of consecutive failed pings to trigger offline mode")):
+        offline_threshold: int = typer.Option(3, help="Number of consecutive failed pings to trigger offline mode"),
+        config: Optional[str] = typer.Option(None, help="Path to config.yaml (filters displayed targets)")):
     conn = db_connect_ro(db)
+    config_targets = load_config_targets(config)
 
     stop = False
     def _stop(*_):
@@ -591,10 +627,10 @@ def tui(db: str = typer.Option(..., help="Path to SQLite database"),
     except Exception:
         pass
 
-    with Live(Align.left(layout_render(conn, offline_threshold)), console=console, refresh_per_second=(1.0 / refresh if refresh > 0 else 4.0), screen=True) as live:
+    with Live(Align.left(layout_render(conn, offline_threshold, config_targets)), console=console, refresh_per_second=(1.0 / refresh if refresh > 0 else 4.0), screen=True) as live:
         while not stop:
             try:
-                view = Align.left(layout_render(conn, offline_threshold))
+                view = Align.left(layout_render(conn, offline_threshold, config_targets))
             except Exception as e:
                 view = Panel(Text(f"Error: {e}", style="red"), title="Netwatch")
             live.update(view, refresh=True)  # in-place screen update
