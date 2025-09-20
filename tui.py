@@ -264,17 +264,39 @@ def cluster_routes(routes: Dict[str, List[str]], threshold: float = SIM_THRESHOL
 # Offline detection
 # --------------------
 
-def check_offline_status(conn: sqlite3.Connection, offline_threshold: int) -> Optional[float]:
-    # Get the most recent pings across all targets
+def get_live_nodes(conn: sqlite3.Connection) -> set:
+    """
+    Get the set of target IDs that have responded successfully at least once in the last hour.
+    These are considered "live" nodes for offline determination purposes.
+    """
+    cutoff = int(time.time()) - 3600  # 1 hour ago
     rows = query_with_retry(
         conn,
         """
+        SELECT DISTINCT target_id
+          FROM ping_samples
+         WHERE ts >= ? AND ok = 1
+        """,
+        (cutoff,),
+    )
+    return {row[0] for row in rows}
+
+def check_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_nodes: set) -> Optional[float]:
+    # Get the most recent pings across all targets, filtered to live nodes only
+    if not live_nodes:
+        return None  # No live nodes to check
+
+    placeholders = ','.join('?' * len(live_nodes))
+    rows = query_with_retry(
+        conn,
+        f"""
         SELECT ts, ok
           FROM ping_samples
+         WHERE target_id IN ({placeholders})
       ORDER BY ts DESC
          LIMIT ?
         """,
-        (offline_threshold,),
+        tuple(live_nodes) + (offline_threshold,),
     )
 
     if len(rows) < offline_threshold:
@@ -293,11 +315,121 @@ def check_offline_status(conn: sqlite3.Connection, offline_threshold: int) -> Op
     return offline_minutes
 
 
+def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_nodes: set, hours_back: int = 168) -> List[int]:
+    """
+    Check offline status for each hour going back from current time.
+    Returns list where 0 = no downtime, >0 = max consecutive failures in that hour.
+    Only returns non-zero if consecutive failures >= offline_threshold.
+    Index 0 is most recent hour. Only considers pings to live nodes.
+    """
+    if not live_nodes:
+        return [0] * hours_back  # No live nodes to check
+
+    current_time = int(time.time())
+    hourly_status = []
+    placeholders = ','.join('?' * len(live_nodes))
+
+    for hour_offset in range(hours_back):
+        # Define hour boundaries
+        hour_end = current_time - (hour_offset * 3600)
+        hour_start = hour_end - 3600
+
+        # Get ALL pings for this hour in chronological order (oldest first), filtered to live nodes
+        rows = query_with_retry(
+            conn,
+            f"""
+            SELECT ts, ok
+              FROM ping_samples
+             WHERE ts >= ? AND ts < ? AND target_id IN ({placeholders})
+          ORDER BY ts ASC
+            """,
+            (hour_start, hour_end) + tuple(live_nodes),
+        )
+
+        # Find the maximum consecutive failures in this hour
+        max_consecutive_failures = 0
+        current_consecutive = 0
+
+        if len(rows) >= offline_threshold:
+            for _, ok in rows:
+                if ok == 0:  # Failed ping
+                    current_consecutive += 1
+                    max_consecutive_failures = max(max_consecutive_failures, current_consecutive)
+                else:  # Successful ping
+                    current_consecutive = 0
+
+        # Only report if it meets the threshold
+        if max_consecutive_failures >= offline_threshold:
+            hourly_status.append(max_consecutive_failures)
+        else:
+            hourly_status.append(0)
+
+    return hourly_status
+
+
 # --------------------
 # Rendering
 # --------------------
 
-def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]]) -> Table:
+def build_offline_hours_line(hourly_status: List[int], max_width: int = 200) -> Text:
+    """
+    Build the offline hours visualization line.
+    Shows red characters representing consecutive failure count for offline hours,
+    spaces for online, with '|' at midnight boundaries.
+    Fits as many hours as possible within the available width.
+    """
+    if not hourly_status:
+        return Text(" Offline hours: (no data)")
+
+    prefix = " Offline hours: "
+    result = Text(prefix)
+
+    # Calculate available width for hour indicators
+    available_width = max_width - len(prefix)
+
+    # Calculate current time info for midnight boundary detection
+    import datetime
+    now = datetime.datetime.now()
+    current_hour = now.hour
+
+    # Each hour takes 1 character, plus boundary markers at midnight
+    hours_displayed = 0
+    chars_used = 0
+
+    for i, consecutive_failures in enumerate(hourly_status):
+        # Calculate what hour this represents (going back from current hour)
+        hour_back = (current_hour - i) % 24
+
+        # Check if we need a midnight boundary marker (transition from 23 to 0)
+        # This happens when we go from hour 0 to hour 23 (crossing midnight going backwards)
+        needs_boundary = i > 0 and hour_back == 23 and ((current_hour - (i-1)) % 24) == 0
+        chars_needed = 1 + (1 if needs_boundary else 0)
+
+        # Stop if we'd exceed available width
+        if chars_used + chars_needed > available_width:
+            break
+
+        # Add midnight boundary marker
+        if needs_boundary:
+            result.append("|", style="dim")
+            chars_used += 1
+
+        # Add hour status
+        if consecutive_failures > 0:
+            # Show count up to 9, then '+' for 10+
+            if consecutive_failures <= 9:
+                result.append(str(consecutive_failures), style="bold red")
+            else:
+                result.append("+", style="bold red")
+        else:
+            result.append(" ")
+
+        chars_used += 1
+        hours_displayed += 1
+
+    return result
+
+def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]], console_width: int = 120) -> Table:
     tbl = Table(box=box.SIMPLE_HEAVY)
     tbl.add_column("Location", width=30)
     for _w, label in WINDOWS:
@@ -395,20 +527,31 @@ def layout_render(conn: sqlite3.Connection, offline_threshold: int) -> Panel:
 
     routes = load_latest_routes(conn)
 
+    # get live nodes for offline determination (call once per update)
+    live_nodes = get_live_nodes(conn)
+
     # check offline status
-    offline_minutes = check_offline_status(conn, offline_threshold)
+    offline_minutes = check_offline_status(conn, offline_threshold, live_nodes)
+    hourly_status = check_hourly_offline_status(conn, offline_threshold, live_nodes)
 
     # compose layout elements
-    table = build_table(targets, window_maps)
+    console_width = console.size.width if console.size else 120
+    table = build_table(targets, window_maps, console_width)
+
+    # Create offline hours line as separate element
+    # Account for panel borders (typically 2-4 chars) to prevent overflow
+    panel_border_width = 8  # Conservative estimate for panel borders + extra margin
+    available_width_for_offline_line = max(50, console_width - panel_border_width)
+    offline_hours_line = build_offline_hours_line(hourly_status, available_width_for_offline_line)
 
     # if offline, show banner instead of normal title
     if offline_minutes is not None:
         offline_banner = build_offline_banner(offline_minutes)
-        top = Panel(table, title="")
+        top = Panel(Group(offline_hours_line, table), title="")
         banner_panel = Panel(Align.center(offline_banner), style="bold red", box=box.HEAVY)
         content = Group(banner_panel, top)
     else:
-        top = Panel(table, title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
+        top = Panel(Group(offline_hours_line, table), title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
         content = Group(top)
 
     targets_by_id = {t.id: t for t in targets}
