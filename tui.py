@@ -351,7 +351,7 @@ def check_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_
 
 def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_nodes: set, hours_back: int = 168) -> List[int]:
     """
-    Check offline status for each hour going back from current time.
+    Check offline status for each hour going back from current hour (clock-aligned).
     Returns list where 0 = no downtime, >0 = max consecutive failures in that hour.
     Only returns non-zero if consecutive failures >= offline_threshold.
     Index 0 is most recent hour. Only considers pings to live nodes.
@@ -359,14 +359,21 @@ def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int
     if not live_nodes:
         return [0] * hours_back  # No live nodes to check
 
-    current_time = int(time.time())
+    import datetime
+    now = datetime.datetime.now()
+    # Round down to the nearest hour (clock-aligned)
+    current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+
     hourly_status = []
     placeholders = ','.join('?' * len(live_nodes))
 
     for hour_offset in range(hours_back):
-        # Define hour boundaries
-        hour_end = current_time - (hour_offset * 3600)
-        hour_start = hour_end - 3600
+        # Define clock-aligned hour boundaries
+        hour_start_dt = current_hour_start - datetime.timedelta(hours=hour_offset)
+        hour_end_dt = hour_start_dt + datetime.timedelta(hours=1)
+
+        hour_start = int(hour_start_dt.timestamp())
+        hour_end = int(hour_end_dt.timestamp())
 
         # Get ALL pings for this hour in chronological order (oldest first), filtered to live nodes
         rows = query_with_retry(
@@ -392,9 +399,83 @@ def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int
                 else:  # Successful ping
                     current_consecutive = 0
 
+        # Check for cross-boundary downtime if we have failures at the edges
+        enhanced_max_consecutive = max_consecutive_failures
+
+        if len(rows) > 0:
+            # Check if downtime starts at the very beginning of the hour
+            if rows[0][1] == 0:  # First ping is a failure
+                # Count consecutive failures at the start of this hour
+                start_failures = 0
+                for _, ok in rows:
+                    if ok == 0:
+                        start_failures += 1
+                    else:
+                        break
+
+                # Look back to previous hour to see if there are more failures
+                prev_hour_start = hour_start - 3600
+                prev_hour_end = hour_start
+                prev_rows = query_with_retry(
+                    conn,
+                    f"""
+                    SELECT ts, ok
+                      FROM ping_samples
+                     WHERE ts >= ? AND ts < ? AND target_id IN ({placeholders})
+                  ORDER BY ts DESC
+                    """,
+                    (prev_hour_start, prev_hour_end) + tuple(live_nodes),
+                )
+
+                # Count consecutive failures at the end of previous hour
+                prev_end_failures = 0
+                for _, ok in prev_rows:
+                    if ok == 0:
+                        prev_end_failures += 1
+                    else:
+                        break
+
+                cross_boundary_failures = prev_end_failures + start_failures
+                enhanced_max_consecutive = max(enhanced_max_consecutive, cross_boundary_failures)
+
+            # Check if downtime ends at the very end of the hour
+            if rows[-1][1] == 0:  # Last ping is a failure
+                # Count consecutive failures at the end of this hour
+                end_failures = 0
+                for _, ok in reversed(rows):
+                    if ok == 0:
+                        end_failures += 1
+                    else:
+                        break
+
+                # Look forward to next hour to see if there are more failures
+                next_hour_start = hour_end
+                next_hour_end = hour_end + 3600
+                next_rows = query_with_retry(
+                    conn,
+                    f"""
+                    SELECT ts, ok
+                      FROM ping_samples
+                     WHERE ts >= ? AND ts < ? AND target_id IN ({placeholders})
+                  ORDER BY ts ASC
+                    """,
+                    (next_hour_start, next_hour_end) + tuple(live_nodes),
+                )
+
+                # Count consecutive failures at the start of next hour
+                next_start_failures = 0
+                for _, ok in next_rows:
+                    if ok == 0:
+                        next_start_failures += 1
+                    else:
+                        break
+
+                cross_boundary_failures = end_failures + next_start_failures
+                enhanced_max_consecutive = max(enhanced_max_consecutive, cross_boundary_failures)
+
         # Only report if it meets the threshold
-        if max_consecutive_failures >= offline_threshold:
-            hourly_status.append(max_consecutive_failures)
+        if enhanced_max_consecutive >= offline_threshold:
+            hourly_status.append(enhanced_max_consecutive)
         else:
             hourly_status.append(0)
 
@@ -424,19 +505,26 @@ def build_offline_hours_line(hourly_status: List[int], max_width: int = 200) -> 
     # Calculate current time info for midnight boundary detection
     import datetime
     now = datetime.datetime.now()
-    current_hour = now.hour
+    current_hour_start = now.replace(minute=0, second=0, microsecond=0)
 
     # Each hour takes 1 character, plus boundary markers at midnight
     hours_displayed = 0
     chars_used = 0
 
     for i, consecutive_failures in enumerate(hourly_status):
-        # Calculate what hour this represents (going back from current hour)
-        hour_back = (current_hour - i) % 24
+        # Calculate the hour this represents (going back from current hour start)
+        hour_dt = current_hour_start - datetime.timedelta(hours=i)
+        hour_of_day = hour_dt.hour
 
-        # Check if we need a midnight boundary marker (transition from 23 to 0)
-        # This happens when we go from hour 0 to hour 23 (crossing midnight going backwards)
-        needs_boundary = i > 0 and hour_back == 23 and ((current_hour - (i-1)) % 24) == 0
+        # Check if we need a midnight boundary marker
+        # This happens when transitioning from hour 0 to hour 23 (crossing midnight going backwards)
+        needs_boundary = False
+        if i > 0:
+            prev_hour_dt = current_hour_start - datetime.timedelta(hours=i-1)
+            prev_hour_of_day = prev_hour_dt.hour
+            # Midnight boundary when going from 0 to 23
+            needs_boundary = (prev_hour_of_day == 0 and hour_of_day == 23)
+
         chars_needed = 1 + (1 if needs_boundary else 0)
 
         # Stop if we'd exceed available width
