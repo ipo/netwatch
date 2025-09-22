@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS trace_hops (
 CREATE INDEX IF NOT EXISTS idx_hops_target_ts ON trace_hops(target_id, ts);
 """
 
-RETENTION_SECONDS = 36 * 3600
+RETENTION_SECONDS = 30 * 24 * 3600  # 30 days
 
 
 def db_connect(path: str) -> sqlite3.Connection:
@@ -385,7 +385,7 @@ async def agent_loop(db_path: str, cfg: Config, dry_run: bool=False) -> None:
                 await asyncio.sleep(0)  # yield
 
             # Periodic prune
-            if now - last_prune > 600:  # every 10 minutes
+            if now - last_prune > 3600:  # every hour
                 db_prune(conn)
                 last_prune = now
 
