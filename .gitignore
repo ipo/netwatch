@@ -7,3 +7,5 @@ netwatch.db-wal
 venv/
 
 __pycache__
+
+*.yaml
