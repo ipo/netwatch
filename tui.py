@@ -108,10 +108,11 @@ class Row:
 # Config loading
 # --------------------
 
-def load_config_targets(config_path: Optional[str]) -> List[str]:
+def load_config_targets(config_path: Optional[str]) -> Optional[List[str]]:
     """Load target IDs from config file using probe.py's config loader."""
+    # None means "no config supplied" so caller can fall back to all targets.
     if not config_path:
-        return []
+        return None
 
     try:
         # Import probe.py's config loader to avoid duplication
@@ -349,15 +350,17 @@ def check_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_
     return offline_minutes
 
 
-def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_nodes: set, hours_back: int = 168) -> List[int]:
+def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int, live_nodes: set, hours_back: int = 168) -> List[Tuple[int, bool]]:
     """
     Check offline status for each hour going back from current hour (clock-aligned).
-    Returns list where 0 = no downtime, >0 = max consecutive failures in that hour.
-    Only returns non-zero if consecutive failures >= offline_threshold.
+    Returns list of tuples where (consecutive_failures, has_data).
+    consecutive_failures: 0 = no downtime, >0 = max consecutive failures in that hour.
+    has_data: True if there were any ping samples in that hour.
+    Only returns non-zero consecutive_failures if >= offline_threshold.
     Index 0 is most recent hour. Only considers pings to live nodes.
     """
     if not live_nodes:
-        return [0] * hours_back  # No live nodes to check
+        return [(0, False)] * hours_back  # No live nodes to check
 
     import datetime
     now = datetime.datetime.now()
@@ -474,10 +477,11 @@ def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int
                 enhanced_max_consecutive = max(enhanced_max_consecutive, cross_boundary_failures)
 
         # Only report if it meets the threshold
+        has_data = len(rows) > 0
         if enhanced_max_consecutive >= offline_threshold:
-            hourly_status.append(enhanced_max_consecutive)
+            hourly_status.append((enhanced_max_consecutive, has_data))
         else:
-            hourly_status.append(0)
+            hourly_status.append((0, has_data))
 
     return hourly_status
 
@@ -486,11 +490,12 @@ def check_hourly_offline_status(conn: sqlite3.Connection, offline_threshold: int
 # Rendering
 # --------------------
 
-def build_offline_hours_line(hourly_status: List[int], max_width: int = 200) -> Text:
+def build_offline_hours_line(hourly_status: List[Tuple[int, bool]], max_width: int = 200) -> Text:
     """
     Build the offline hours visualization line.
     Shows red characters representing consecutive failure count for offline hours,
-    spaces for online, with '|' at midnight boundaries.
+    dark grey '-' for hours with data but no offline criteria fulfilled,
+    spaces for hours with no data, with '|' at midnight boundaries.
     Fits as many hours as possible within the available width.
     """
     if not hourly_status:
@@ -511,7 +516,7 @@ def build_offline_hours_line(hourly_status: List[int], max_width: int = 200) -> 
     hours_displayed = 0
     chars_used = 0
 
-    for i, consecutive_failures in enumerate(hourly_status):
+    for i, (consecutive_failures, has_data) in enumerate(hourly_status):
         # Calculate the hour this represents (going back from current hour start)
         hour_dt = current_hour_start - datetime.timedelta(hours=i)
         hour_of_day = hour_dt.hour
@@ -543,7 +548,11 @@ def build_offline_hours_line(hourly_status: List[int], max_width: int = 200) -> 
                 result.append(str(consecutive_failures), style="bold red")
             else:
                 result.append("+", style="bold red")
+        elif has_data:
+            # Has data but no offline criteria fulfilled - show dark grey dash
+            result.append("-", style="dim")
         else:
+            # No data - show space
             result.append(" ")
 
         chars_used += 1
@@ -551,14 +560,70 @@ def build_offline_hours_line(hourly_status: List[int], max_width: int = 200) -> 
 
     return result
 
-def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]], console_width: int = 120) -> Table:
-    tbl = Table(box=box.SIMPLE_HEAVY)
-    tbl.add_column("Location", width=30)
-    for _w, label in WINDOWS:
-        tbl.add_column(label, justify="right")
+def _measure_window_cell(rec: Optional[Tuple[int, int, Optional[float], Optional[float]]],
+                        thresh_low: float,
+                        thresh_high: float) -> int:
+    """
+    Return the printable length of a loss/rtt cell (plain characters, no ANSI),
+    e.g. '0.1% / 34ms'. Keeps measurement logic in one place.
+    """
+    if rec is None:
+        return len("--")
 
-    # Calculate dynamic RTT thresholds
+    total, _fails, loss, avg_rtt = rec
+    loss_text = fmt_loss(loss, total)
+    rtt_text = fmt_avg_rtt(avg_rtt, total, thresh_low, thresh_high)
+    combined = f"{loss_text.plain} / {rtt_text.plain}"
+    return len(combined)
+
+
+def _truncate_label(label: str, max_width: int) -> str:
+    """Truncate label to fit within max_width, appending '..' when needed."""
+    if len(label) <= max_width:
+        return label
+    if max_width <= 2:
+        return label[:max_width]
+    return label[: max_width - 2] + ".."
+
+
+def build_table(
+    targets: List[Target],
+    window_maps: Dict[int, Dict[str, Tuple[int, int, Optional[float], Optional[float]]]],
+    console_width: int = 120,
+) -> Table:
+    # Calculate dynamic RTT thresholds first
     thresh_low, thresh_high = calculate_rtt_thresholds(window_maps)
+
+    # Determine required width for each metric column (content only, no padding)
+    window_col_widths: Dict[int, int] = {}
+    for w, label in WINDOWS:
+        max_len = len(label)
+        for t in targets:
+            rec = window_maps[w].get(t.id)
+            max_len = max(max_len, _measure_window_cell(rec, thresh_low, thresh_high))
+        # Add buffer so loss/rtt text isn't clipped; user asked for extra room
+        window_col_widths[w] = max_len + 4
+
+    # Accurate width budget: Rich table width ~= sum(col_widths)
+    # + padding(2 per col) + vertical borders (num_cols + 1).
+    num_cols = 1 + len(WINDOWS)
+    padding_lr = 1  # from padding=(0,1) set below
+    fixed_overhead = (padding_lr * 2 * num_cols) + (num_cols + 1)
+
+    metrics_total = sum(window_col_widths.values())
+    remaining = console_width - fixed_overhead - metrics_total
+    # Keep the label reasonably wide; fall back to 10 chars minimum.
+    label_width = max(10, remaining)
+
+    # If still over budget (console very narrow), cap at remaining space.
+    total_estimated_width = metrics_total + label_width + fixed_overhead
+    if total_estimated_width > console_width:
+        label_width = max(10, console_width - fixed_overhead - metrics_total)
+
+    tbl = Table(box=box.SIMPLE_HEAVY, padding=(0, 1))
+    tbl.add_column("Location", width=label_width, no_wrap=True)
+    for w, label in WINDOWS:
+        tbl.add_column(label, justify="right", width=window_col_widths[w], no_wrap=True)
 
     # Build rows with sorting
     def get_sort_key(target: Target) -> Tuple[float, float, float, str]:
@@ -581,7 +646,10 @@ def build_table(targets: List[Target], window_maps: Dict[int, Dict[str, Tuple[in
     sorted_targets = sorted(targets, key=get_sort_key)
 
     for t in sorted_targets:
-        row = [Text(f"{t.name} [{t.id}]", style="bold")]
+        # Show tag/ID first for quicker scanning, format: "tag: name"
+        raw_label = f"{t.id}: {t.name}"
+        label = _truncate_label(raw_label, label_width)
+        row = [Text(label, style="bold")]
         for w, _label in WINDOWS:
             rec = window_maps[w].get(t.id)
             if rec is None:
@@ -666,15 +734,9 @@ def layout_render(conn: sqlite3.Connection, offline_threshold: int, config_targe
     available_width_for_offline_line = max(50, console_width - panel_border_width)
     offline_hours_line = build_offline_hours_line(hourly_status, available_width_for_offline_line)
 
-    # if offline, show banner instead of normal title
-    if offline_minutes is not None:
-        offline_banner = build_offline_banner(offline_minutes)
-        top = Panel(Group(offline_hours_line, table), title="")
-        banner_panel = Panel(Align.center(offline_banner), style="bold red", box=box.HEAVY)
-        content = Group(banner_panel, top)
-    else:
-        top = Panel(Group(offline_hours_line, table), title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
-        content = Group(top)
+    # Always show the standard header; offline banner is disabled
+    top = Panel(Group(offline_hours_line, table), title="Netwatch — Loss% / Avg RTT by Window (sorted by 5m loss, then ping)")
+    content = Group(top)
 
     targets_by_id = {t.id: t for t in targets}
     routes_panel = build_routes_panel(targets_by_id, routes)
